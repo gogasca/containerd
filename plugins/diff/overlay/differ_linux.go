@@ -34,6 +34,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
@@ -114,11 +115,16 @@ func (s *overlayDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 			config.MediaType = ocispec.MediaTypeImageLayerGzip
 		}
 		switch config.MediaType {
-		case ocispec.MediaTypeImageLayer:
+		case ocispec.MediaTypeImageLayer,
+			images.MediaTypeDockerSchema2Layer,
+			images.MediaTypeDockerSchema2LayerForeign:
 			compressionType = compression.Uncompressed
-		case ocispec.MediaTypeImageLayerGzip:
+		case ocispec.MediaTypeImageLayerGzip,
+			images.MediaTypeDockerSchema2LayerGzip,
+			images.MediaTypeDockerSchema2LayerForeignGzip:
 			compressionType = compression.Gzip
-		case ocispec.MediaTypeImageLayerZstd:
+		case ocispec.MediaTypeImageLayerZstd,
+			images.MediaTypeDockerSchema2LayerZstd:
 			compressionType = compression.Zstd
 		default:
 			return emptyDesc, fmt.Errorf("unsupported diff media type: %v: %w", config.MediaType, errdefs.ErrNotImplemented)
