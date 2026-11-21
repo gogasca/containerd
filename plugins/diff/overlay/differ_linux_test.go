@@ -186,6 +186,30 @@ func TestGetUpperDir(t *testing.T) {
 			expected: "",
 		},
 		{
+			name: "indexed overlay hardlinks enabled",
+			mounts: []mount.Mount{{
+				Type: "overlay",
+				Options: []string{"lowerdir=/lower", "upperdir=/upper", "index=on"},
+			}},
+			expected: "",
+		},
+		{
+			name: "indexed overlay hardlinks disabled",
+			mounts: []mount.Mount{{
+				Type: "overlay",
+				Options: []string{"lowerdir=/lower", "upperdir=/upper", "index=off"},
+			}},
+			expected: "/upper",
+		},
+		{
+			name: "NFS export requires overlay index",
+			mounts: []mount.Mount{{
+				Type: "overlay",
+				Options: []string{"lowerdir=/lower", "upperdir=/upper", "nfs_export=on"},
+			}},
+			expected: "",
+		},
+		{
 			name: "redirect directory disabled",
 			mounts: []mount.Mount{{
 				Type: "overlay",
