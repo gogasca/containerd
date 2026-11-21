@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/containerd/containerd/v2/pkg/archive"
+	"github.com/containerd/containerd/v2/pkg/testutil"
 )
 
 func assertWalkingFallback(t *testing.T, lower, upper string) {
@@ -55,9 +56,7 @@ func assertWalkingRoundTrip(t *testing.T, lower, merged, target string) {
 // A dangling symlink in the lower tree must be removed with an OCI whiteout,
 // not archived as an added overlayfs character device.
 func TestDanglingSymlinkWhiteoutUsesWalkingFallback(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("overlay character-device whiteouts require root")
-	}
+	testutil.RequiresRoot(t)
 	lower, upper, merged, target := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
 	for _, root := range []string{lower, target} {
 		if err := os.Symlink("missing-target", filepath.Join(root, "gone")); err != nil {
@@ -78,9 +77,7 @@ func TestDanglingSymlinkWhiteoutUsesWalkingFallback(t *testing.T) {
 // A stale overlay whiteout with no corresponding lower path must not be
 // archived as an added device node. The mounted-view differ is authoritative.
 func TestOrphanOverlayWhiteoutUsesWalkingFallback(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("creating overlay character-device whiteouts requires root")
-	}
+	testutil.RequiresRoot(t)
 	lower, upper := t.TempDir(), t.TempDir()
 	if err := unix.Mknod(filepath.Join(upper, "orphan"), unix.S_IFCHR|0600, 0); err != nil {
 		t.Skipf("creating overlay whiteout not permitted: %v", err)
@@ -115,9 +112,7 @@ func TestSymlinkReplacementUsesWalkingFallback(t *testing.T) {
 // Directory-only chown operations can leave size, mode and mtime unchanged;
 // the continuity fast path then skips the metadata change.
 func TestDirectoryOwnershipUsesWalkingFallback(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("changing directory ownership requires root")
-	}
+	testutil.RequiresRoot(t)
 	lower, upper, target := t.TempDir(), t.TempDir(), t.TempDir()
 	for _, root := range []string{lower, upper, target} {
 		if err := os.Mkdir(filepath.Join(root, "dir"), 0755); err != nil {
