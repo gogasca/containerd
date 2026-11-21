@@ -170,11 +170,24 @@ func overlayLowerMatches(lower, upper []mount.Mount) bool {
 }
 
 // Metacopy, redirect_dir and index can be enabled by module parameters even
-// when absent from the mount options. Raw upperdirs cannot safely represent
+// when absent from mount options. Raw upperdirs cannot safely represent
 // their inherited file data, redirected children or indexed hardlinks.
-// Fail closed when the module parameters cannot be read.
-func overlayFastPathFeaturesDisabled() bool {
-	for _, feature := range []string{"metacopy", "redirect_dir", "index"} {
+// Explicit index=off overrides the kernel default; other overrides that
+// enable unsupported features are rejected earlier by getUpperDir.
+// Fail closed when a required module parameter cannot be read.
+func overlayFastPathFeaturesDisabled(options []string) bool {
+	features := []string{"metacopy", "redirect_dir"}
+	indexOff := false
+	for _, option := range options {
+		if option == "index=off" {
+			indexOff = true
+			break
+		}
+	}
+	if !indexOff {
+		features = append(features, "index")
+	}
+	for _, feature := range features {
 		value, err := os.ReadFile("/sys/module/overlay/parameters/" + feature)
 		if err != nil || !strings.EqualFold(strings.TrimSpace(string(value)), "N") {
 			return false
@@ -393,7 +406,7 @@ func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperDir s
 // surface the error directly to the caller.
 func (s *overlayDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (ocispec.Descriptor, error) {
 	upperDir := getUpperDir(upper)
-	if upperDir == "" || !overlayFastPathFeaturesDisabled() || !overlayLowerMatches(lower, upper) {
+	if upperDir == "" || !overlayFastPathFeaturesDisabled(upper[0].Options) || !overlayLowerMatches(lower, upper) {
 		return emptyDesc, fmt.Errorf("overlay fast path is not safe for these mounts: %w", errdefs.ErrNotImplemented)
 	}
 
