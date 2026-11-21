@@ -97,6 +97,15 @@ func getUpperDir(mounts []mount.Mount) string {
 		if strings.HasPrefix(option, "redirect_dir=") && option != "redirect_dir=off" {
 			return ""
 		}
+		// Indexed overlayfs can copy up a lower hardlink through an index
+		// inode. The raw upperdir does not describe all visible link names.
+		if strings.HasPrefix(option, "index=") && option != "index=off" {
+			return ""
+		}
+		// NFS export requires an overlay index for writable mounts.
+		if strings.HasPrefix(option, "nfs_export=") && option != "nfs_export=off" {
+			return ""
+		}
 	}
 	return upper
 }
@@ -160,12 +169,12 @@ func overlayLowerMatches(lower, upper []mount.Mount) bool {
 	}
 }
 
-// Both metacopy and redirect_dir can be enabled by module parameters even
-// when absent from the mount options. Raw upperdirs cannot represent file
-// data in metacopy files or the inherited children of redirected directories.
+// Metacopy, redirect_dir and index can be enabled by module parameters even
+// when absent from the mount options. Raw upperdirs cannot safely represent
+// their inherited file data, redirected children or indexed hardlinks.
 // Fail closed when the module parameters cannot be read.
 func overlayFastPathFeaturesDisabled() bool {
-	for _, feature := range []string{"metacopy", "redirect_dir"} {
+	for _, feature := range []string{"metacopy", "redirect_dir", "index"} {
 		value, err := os.ReadFile("/sys/module/overlay/parameters/" + feature)
 		if err != nil || !strings.EqualFold(strings.TrimSpace(string(value)), "N") {
 			return false
