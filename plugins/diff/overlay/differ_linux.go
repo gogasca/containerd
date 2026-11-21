@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -172,23 +173,19 @@ func overlayLowerMatches(lower, upper []mount.Mount) bool {
 // Metacopy, redirect_dir and index can be enabled by module parameters even
 // when absent from mount options. Raw upperdirs cannot safely represent
 // their inherited file data, redirected children or indexed hardlinks.
-// Explicit index=off overrides the kernel default; other overrides that
-// enable unsupported features are rejected earlier by getUpperDir.
+// Explicit feature=off overrides the kernel default; options that enable
+// unsupported features are rejected earlier by getUpperDir.
 // Fail closed when a required module parameter cannot be read.
 func overlayFastPathFeaturesDisabled(options []string) bool {
-	features := []string{"metacopy", "redirect_dir"}
-	indexOff := false
-	for _, option := range options {
-		if option == "index=off" {
-			indexOff = true
-			break
+	return overlayFastPathFeaturesDisabledWithReader(options, os.ReadFile)
+}
+
+func overlayFastPathFeaturesDisabledWithReader(options []string, readFile func(string) ([]byte, error)) bool {
+	for _, feature := range []string{"metacopy", "redirect_dir", "index"} {
+		if slices.Contains(options, feature+"=off") {
+			continue
 		}
-	}
-	if !indexOff {
-		features = append(features, "index")
-	}
-	for _, feature := range features {
-		value, err := os.ReadFile("/sys/module/overlay/parameters/" + feature)
+		value, err := readFile("/sys/module/overlay/parameters/" + feature)
 		if err != nil || !strings.EqualFold(strings.TrimSpace(string(value)), "N") {
 			return false
 		}
