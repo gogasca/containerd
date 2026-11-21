@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/containerd/continuity/fs"
@@ -265,6 +266,81 @@ func TestGetUpperDir(t *testing.T) {
 
 // TestOverlayLowerMatches verifies that an overlay upperdir is never used as
 // a diff against a different base snapshot.
+// Module defaults only govern features without an explicit mount override.
+// These cases avoid depending on the CI runner's overlay module parameters.
+func TestOverlayFastPathFeatureMountOverrides(t *testing.T) {
+	tests := []struct {
+		name         string
+		options      []string
+		moduleValues map[string]string
+		want         bool
+		reads        []string
+	}{
+		{
+			name:         "defaults disabled",
+			moduleValues: map[string]string{"metacopy": "N", "redirect_dir": "N", "index": "N"},
+			want:         true,
+			reads:        []string{"metacopy", "redirect_dir", "index"},
+		},
+		{
+			name:         "index off overrides enabled default",
+			options:      []string{"index=off"},
+			moduleValues: map[string]string{"metacopy": "N", "redirect_dir": "N", "index": "Y"},
+			want:         true,
+			reads:        []string{"metacopy", "redirect_dir"},
+		},
+		{
+			name:         "metacopy off overrides enabled default",
+			options:      []string{"metacopy=off"},
+			moduleValues: map[string]string{"metacopy": "Y", "redirect_dir": "N", "index": "N"},
+			want:         true,
+			reads:        []string{"redirect_dir", "index"},
+		},
+		{
+			name:         "redirect off overrides enabled default",
+			options:      []string{"redirect_dir=off"},
+			moduleValues: map[string]string{"metacopy": "N", "redirect_dir": "Y", "index": "N"},
+			want:         true,
+			reads:        []string{"metacopy", "index"},
+		},
+		{
+			name:    "all explicitly disabled even when parameters unavailable",
+			options: []string{"metacopy=off", "redirect_dir=off", "index=off"},
+			want:    true,
+		},
+		{
+			name:         "enabled module default blocks fast path",
+			moduleValues: map[string]string{"metacopy": "Y", "redirect_dir": "N", "index": "N"},
+			reads:        []string{"metacopy"},
+		},
+		{
+			name:  "missing module parameter blocks fast path",
+			reads: []string{"metacopy"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotReads []string
+			reader := func(path string) ([]byte, error) {
+				feature := filepath.Base(path)
+				gotReads = append(gotReads, feature)
+				value, ok := tc.moduleValues[feature]
+				if !ok {
+					return nil, os.ErrNotExist
+				}
+				return []byte(value + "\n"), nil
+			}
+			got := overlayFastPathFeaturesDisabledWithReader(tc.options, reader)
+			if got != tc.want {
+				t.Fatalf("overlayFastPathFeaturesDisabledWithReader(%v) = %v, want %v", tc.options, got, tc.want)
+			}
+			if !slices.Equal(gotReads, tc.reads) {
+				t.Fatalf("read module parameters %v, want %v", gotReads, tc.reads)
+			}
+		})
+	}
+}
+
 func TestOverlayLowerMatches(t *testing.T) {
 	tests := []struct {
 		name  string
