@@ -289,10 +289,10 @@ func hasNestedLowerMount(root string, mounts []*mountinfo.Info) (nested, foundRo
 		if entry.Mountpoint == root {
 			foundRoot = true
 		} else if strings.HasPrefix(entry.Mountpoint, prefix) {
-			return true, true
+			nested = true
 		}
 	}
-	return false, foundRoot
+	return nested, foundRoot
 }
 
 // requireFlatLowerMount ensures that the temporary lower mount has no nested
