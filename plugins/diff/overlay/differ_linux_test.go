@@ -28,10 +28,43 @@ import (
 
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
+	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sys/unix"
 
 	"github.com/containerd/containerd/v2/core/mount"
 )
+
+// The lower mount may use rbind and include submounts that are absent from
+// the overlay lowerdir; in that case only the walking differ sees the correct
+// lower tree. Exact mountpoint boundaries matter here ("/lower2" is a peer).
+func TestHasNestedLowerMount(t *testing.T) {
+	root := "/tmp/containerd-mount"
+	for _, tc := range []struct {
+		name      string
+		paths     []string
+		nested    bool
+		foundRoot bool
+	}{
+		{name: "root only", paths: []string{root}, foundRoot: true},
+		{name: "nested mount", paths: []string{root, root + "/nested"}, nested: true, foundRoot: true},
+		{name: "deep nested mount", paths: []string{root, root + "/nested/deep"}, nested: true, foundRoot: true},
+		{name: "sibling path", paths: []string{root, root + "2/nested"}, foundRoot: true},
+		{name: "unrelated mount", paths: []string{"/tmp/another"}, foundRoot: false},
+		{name: "submount without root", paths: []string{root + "/nested"}, nested: true, foundRoot: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := make([]*mountinfo.Info, 0, len(tc.paths))
+			for _, path := range tc.paths {
+				entries = append(entries, &mountinfo.Info{Mountpoint: path})
+			}
+			nested, foundRoot := hasNestedLowerMount(root, entries)
+			if nested != tc.nested || foundRoot != tc.foundRoot {
+				t.Fatalf("hasNestedLowerMount(%q, %v) = (%v, %v), want (%v, %v)",
+					root, tc.paths, nested, foundRoot, tc.nested, tc.foundRoot)
+			}
+		})
+	}
+}
 
 func TestGetUpperDir(t *testing.T) {
 	tests := []struct {
