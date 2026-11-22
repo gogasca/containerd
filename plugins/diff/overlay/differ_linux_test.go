@@ -264,6 +264,61 @@ func TestGetUpperDir(t *testing.T) {
 }
 
 
+// Overlay-typed mount entries can still perform bind or remount operations.
+// Their Source, rather than upperdir/lowerdir, controls the mounted view.
+func TestGetUpperDirRejectsNonOverlayMountOperations(t *testing.T) {
+	for _, operation := range []string{"bind", "rbind", "remount"} {
+		t.Run(operation, func(t *testing.T) {
+			mounts := []mount.Mount{{
+				Type:    "overlay",
+				Source:  "/source",
+				Options: []string{"lowerdir=/lower", "upperdir=/upper", operation},
+			}}
+			if got := getUpperDir(mounts); got != "" {
+				t.Fatalf("getUpperDir() with %q = %q, want fallback", operation, got)
+			}
+		})
+	}
+}
+
+func TestOverlayLowerMatchesRejectsNonOverlayMountOperations(t *testing.T) {
+	upper := []mount.Mount{{Type: "overlay", Options: []string{"lowerdir=/lower", "upperdir=/upper"}}}
+	lower := []mount.Mount{{Type: "overlay", Options: []string{"lowerdir=/lower"}}}
+	for _, operation := range []string{"bind", "rbind", "remount"} {
+		t.Run("upper_"+operation, func(t *testing.T) {
+			invalidUpper := []mount.Mount{{
+				Type:    "overlay",
+				Source:  "/source",
+				Options: []string{"lowerdir=/lower", "upperdir=/upper", operation},
+			}}
+			if overlayLowerMatches(lower, invalidUpper) {
+				t.Fatalf("accepted overlay-typed upper mount with %q", operation)
+			}
+		})
+		t.Run("lower_"+operation, func(t *testing.T) {
+			invalidLower := []mount.Mount{{
+				Type:    "overlay",
+				Source:  "/source",
+				Options: []string{"lowerdir=/lower", operation},
+			}}
+			if overlayLowerMatches(invalidLower, upper) {
+				t.Fatalf("accepted overlay-typed lower mount with %q", operation)
+			}
+		})
+	}
+
+	// An ordinary bind lower mount is still supported when it matches the
+	// overlay's single lowerdir; only overlay-typed mounts are restricted.
+	for _, option := range []string{"bind", "rbind"} {
+		t.Run("valid_bind_lower_"+option, func(t *testing.T) {
+			bindLower := []mount.Mount{{Type: "bind", Source: "/lower", Options: []string{option}}}
+			if !overlayLowerMatches(bindLower, upper) {
+				t.Fatalf("rejected ordinary bind lower mount with %q", option)
+			}
+		})
+	}
+}
+
 // TestOverlayLowerMatches verifies that an overlay upperdir is never used as
 // a diff against a different base snapshot.
 // Module defaults only govern features without an explicit mount override.
