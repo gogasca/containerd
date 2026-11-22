@@ -57,6 +57,15 @@ func uniqueRef() string {
 	return fmt.Sprintf("%d-%s", t.UnixNano(), base64.URLEncoding.EncodeToString(b[:]))
 }
 
+// hasNonOverlayMountOperation rejects mount flags that cause mount.Mount to
+// perform a bind or remount operation even when its Type says "overlay".
+// Reading an upperdir from such a mount would not describe its mounted view.
+func hasNonOverlayMountOperation(options []string) bool {
+	return slices.Contains(options, "bind") ||
+		slices.Contains(options, "rbind") ||
+		slices.Contains(options, "remount")
+}
+
 // getUpperDir only accepts a single overlay mount of the whole root.
 // Multi-mount layouts or mounts at subdirectory targets need the walking
 // differ, because an upperdir alone does not describe the whole tree.
@@ -65,7 +74,7 @@ func getUpperDir(mounts []mount.Mount) string {
 		return ""
 	}
 	m := mounts[0]
-	if m.Target != "" && m.Target != "/" {
+	if (m.Target != "" && m.Target != "/") || hasNonOverlayMountOperation(m.Options) {
 		return ""
 	}
 
@@ -115,10 +124,14 @@ func getUpperDir(mounts []mount.Mount) string {
 // overlay's lower layer. An overlay upperdir is not a diff against an arbitrary
 // base, so ambiguous mounts must fall back to the walking differ.
 func overlayLowerMatches(lower, upper []mount.Mount) bool {
-	if len(lower) != 1 || len(upper) != 1 {
+	if len(lower) != 1 || len(upper) != 1 || upper[0].Type != "overlay" ||
+		hasNonOverlayMountOperation(upper[0].Options) {
 		return false
 	}
 	m := lower[0]
+	if m.Type == "overlay" && hasNonOverlayMountOperation(m.Options) {
+		return false
+	}
 	if m.Target != "" && m.Target != "/" {
 		return false
 	}
