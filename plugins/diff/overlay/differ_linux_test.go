@@ -50,7 +50,7 @@ func TestHasNestedLowerMount(t *testing.T) {
 		{name: "deep nested mount", paths: []string{root, root + "/nested/deep"}, nested: true, foundRoot: true},
 		{name: "sibling path", paths: []string{root, root + "2/nested"}, foundRoot: true},
 		{name: "unrelated mount", paths: []string{"/tmp/another"}, foundRoot: false},
-		{name: "submount without root", paths: []string{root + "/nested"}, nested: true, foundRoot: true},
+		{name: "submount without root", paths: []string{root + "/nested"}, nested: true, foundRoot: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			entries := make([]*mountinfo.Info, 0, len(tc.paths))
