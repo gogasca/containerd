@@ -35,6 +35,7 @@ import (
 	"github.com/containerd/continuity/sysx"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/moby/sys/mountinfo"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
@@ -278,6 +279,41 @@ func hasOverlayRootOpacity(upperDir string) (bool, error) {
 	return false, nil
 }
 
+// hasNestedLowerMount reports mountpoints below the temporarily mounted lower
+// root. A recursive bind can expose submounts that are not represented by the
+// overlay's lowerdir paths, so comparing against its mounted view is unsafe.
+func hasNestedLowerMount(root string, mounts []*mountinfo.Info) (nested, foundRoot bool) {
+	root = filepath.Clean(root)
+	prefix := root + string(os.PathSeparator)
+	for _, entry := range mounts {
+		if entry.Mountpoint == root {
+			foundRoot = true
+		} else if strings.HasPrefix(entry.Mountpoint, prefix) {
+			return true, true
+		}
+	}
+	return false, foundRoot
+}
+
+// requireFlatLowerMount ensures that the temporary lower mount has no nested
+// mountpoints that could change the view relative to the overlay lowerdir.
+// Fail closed if mountinfo is unavailable or the temporary mount is not found.
+func requireFlatLowerMount(root string) error {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("cannot resolve lower mount %q: %v: %w", root, err, errdefs.ErrNotImplemented)
+	}
+	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(realRoot))
+	if err != nil {
+		return fmt.Errorf("cannot inspect nested lower mounts: %v: %w", err, errdefs.ErrNotImplemented)
+	}
+	nested, foundRoot := hasNestedLowerMount(realRoot, mounts)
+	if nested || !foundRoot {
+		return fmt.Errorf("lower mount %q has nested or unverified mountpoints: %w", realRoot, errdefs.ErrNotImplemented)
+	}
+	return nil
+}
+
 // requireSafeUpperDir checks metadata that continuity's DiffDirChanges does
 // not compare. This walks only the upperdir; if a change cannot be represented
 // safely, the service retries with the generic walking differ.
@@ -391,6 +427,9 @@ func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperDir s
 		return fmt.Errorf("opaque overlay upperdir root requires walking differ: %w", errdefs.ErrNotImplemented)
 	}
 	return mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
+		if err := requireFlatLowerMount(lowerRoot); err != nil {
+			return err
+		}
 		if err := requireSafeUpperDir(ctx, lowerRoot, upperDir); err != nil {
 			return err
 		}
