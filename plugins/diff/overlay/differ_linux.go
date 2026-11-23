@@ -17,20 +17,28 @@
 package overlay
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/containerd/continuity/fs"
+	"github.com/containerd/continuity/sysx"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/moby/sys/mountinfo"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
@@ -50,33 +58,384 @@ func uniqueRef() string {
 	return fmt.Sprintf("%d-%s", t.UnixNano(), base64.URLEncoding.EncodeToString(b[:]))
 }
 
-// getUpperDir extracts the upperdir path from overlay mount options.
-// Returns an empty string if the last mount is not an overlay mount or
-// if no upperdir option is present (e.g. read-only overlay mounts).
+// hasNonOverlayMountOperation rejects mount flags that cause mount.Mount to
+// perform a bind or remount operation even when its Type says "overlay".
+// Reading an upperdir from such a mount would not describe its mounted view.
+func hasNonOverlayMountOperation(options []string) bool {
+	return slices.Contains(options, "bind") ||
+		slices.Contains(options, "rbind") ||
+		slices.Contains(options, "remount")
+}
+
+// getUpperDir only accepts a single overlay mount of the whole root.
+// Multi-mount layouts or mounts at subdirectory targets need the walking
+// differ, because an upperdir alone does not describe the whole tree.
 func getUpperDir(mounts []mount.Mount) string {
-	if len(mounts) == 0 {
+	if len(mounts) != 1 || mounts[0].Type != "overlay" {
 		return ""
 	}
-	m := mounts[len(mounts)-1]
-	if m.Type != "overlay" {
+	m := mounts[0]
+	if (m.Target != "" && m.Target != "/") || hasNonOverlayMountOperation(m.Options) {
 		return ""
 	}
-	for _, o := range m.Options {
-		if strings.HasPrefix(o, "upperdir=") {
-			return strings.TrimPrefix(o, "upperdir=")
+
+	var upper string
+	for _, option := range m.Options {
+		// A comma-joined or kernel-escaped option cannot be safely used as
+		// a filesystem path without decoding. Fall back instead.
+		if strings.ContainsAny(option, ",\\") {
+			return ""
+		}
+		if strings.HasPrefix(option, "upperdir=") {
+			if upper != "" {
+				return ""
+			}
+			upper = strings.TrimPrefix(option, "upperdir=")
+		}
+		// The raw upperdir has host ownership, not the ID-mapped mount view.
+		// Use the walking differ if either mapping is present.
+		if strings.HasPrefix(option, "uidmap=") || strings.HasPrefix(option, "gidmap=") {
+			return ""
+		}
+		// The continuity fast path does not understand user.overlay whiteouts.
+		// A userxattr mount must use the walking differ.
+		if option == "userxattr" || strings.HasPrefix(option, "userxattr=") {
+			return ""
+		}
+		if strings.HasPrefix(option, "metacopy=") && option != "metacopy=off" {
+			return ""
+		}
+		if strings.HasPrefix(option, "redirect_dir=") && option != "redirect_dir=off" {
+			return ""
+		}
+		// Indexed overlayfs can copy up a lower hardlink through an index
+		// inode. The raw upperdir does not describe all visible link names.
+		if strings.HasPrefix(option, "index=") && option != "index=off" {
+			return ""
+		}
+		// NFS export requires an overlay index for writable mounts.
+		if strings.HasPrefix(option, "nfs_export=") && option != "nfs_export=off" {
+			return ""
 		}
 	}
-	return ""
+	return upper
+}
+
+// overlayLowerMatches proves that the requested lower view is exactly the
+// overlay's lower layer. An overlay upperdir is not a diff against an arbitrary
+// base, so ambiguous mounts must fall back to the walking differ.
+func overlayLowerMatches(lower, upper []mount.Mount) bool {
+	if len(lower) != 1 || len(upper) != 1 || upper[0].Type != "overlay" ||
+		hasNonOverlayMountOperation(upper[0].Options) {
+		return false
+	}
+	m := lower[0]
+	if m.Type == "overlay" && hasNonOverlayMountOperation(m.Options) {
+		return false
+	}
+	if m.Target != "" && m.Target != "/" {
+		return false
+	}
+	for _, option := range m.Options {
+		if strings.HasPrefix(option, "uidmap=") || strings.HasPrefix(option, "gidmap=") ||
+			option == "userxattr" || strings.HasPrefix(option, "userxattr=") {
+			// Lower and upper must use the same whiteout namespace.
+			// The raw-upperdir differ cannot prove this for userxattr mounts.
+			return false
+		}
+	}
+	var upperLayers string
+	for _, option := range upper[0].Options {
+		if strings.HasPrefix(option, "lowerdir=") {
+			if upperLayers != "" {
+				return false
+			}
+			upperLayers = strings.TrimPrefix(option, "lowerdir=")
+		}
+	}
+	if upperLayers == "" {
+		return false
+	}
+	switch m.Type {
+	case "bind":
+		// Single bind-mounted lower directory, with no secondary layers.
+		if strings.Contains(upperLayers, ":") || m.Source == "" {
+			return false
+		}
+		return filepath.Clean(m.Source) == filepath.Clean(upperLayers)
+	case "overlay":
+		// Only a read-only overlay is eligible: an upperdir on this mount
+		// could contribute additional data not described by lowerdir.
+		var layers string
+		for _, option := range m.Options {
+			if strings.HasPrefix(option, "upperdir=") || strings.ContainsAny(option, ",\\") {
+				return false
+			}
+			if strings.HasPrefix(option, "lowerdir=") {
+				if layers != "" {
+					return false
+				}
+				layers = strings.TrimPrefix(option, "lowerdir=")
+			}
+		}
+		return layers != "" && layers == upperLayers
+	default:
+		return false
+	}
+}
+
+// Metacopy, redirect_dir and index can be enabled by module parameters even
+// when absent from mount options. Raw upperdirs cannot safely represent
+// their inherited file data, redirected children or indexed hardlinks.
+// Explicit feature=off overrides the kernel default; options that enable
+// unsupported features are rejected earlier by getUpperDir.
+// Fail closed when a required module parameter cannot be read.
+func overlayFastPathFeaturesDisabled(options []string) bool {
+	return overlayFastPathFeaturesDisabledWithReader(options, os.ReadFile)
+}
+
+func overlayFastPathFeaturesDisabledWithReader(options []string, readFile func(string) ([]byte, error)) bool {
+	for _, feature := range []string{"metacopy", "redirect_dir", "index"} {
+		if slices.Contains(options, feature+"=off") {
+			continue
+		}
+		value, err := readFile("/sys/module/overlay/parameters/" + feature)
+		if err != nil || !strings.EqualFold(strings.TrimSpace(string(value)), "N") {
+			return false
+		}
+	}
+	return true
+}
+
+// finalizeCompressedDiff must check Close because compressors may buffer
+// bytes until finalization. Preserve the write error if both operations fail.
+func finalizeCompressedDiff(compressed io.WriteCloser, writeErr error) error {
+	return errors.Join(writeErr, compressed.Close())
+}
+
+// hasOverlayXattrWhiteout recognizes the alternate overlayfs whiteout
+// representation: an empty regular file with an overlay.whiteout xattr.
+// DiffDirChanges only recognizes character-device whiteouts, and exporting
+// such a file directly would produce an incorrect image layer.
+func hasOverlayXattrWhiteout(path string) (bool, error) {
+	for _, name := range []string{"user.overlay.whiteout", "trusted.overlay.whiteout"} {
+		// A zero-length xattr is a valid whiteout: only its presence matters.
+		_, err := unix.Lgetxattr(path, name, nil)
+		switch {
+		case err == nil:
+			return true, nil
+		case errors.Is(err, unix.ENODATA), errors.Is(err, unix.ENOTSUP):
+			continue
+		default:
+			// If the xattr cannot be inspected, fall back rather than
+			// potentially exporting a whiteout as an ordinary file.
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func withOverlayWhiteoutFallback(upperDir string, handle fs.ChangeFunc) fs.ChangeFunc {
+	return func(kind fs.ChangeKind, path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		// Continuity may interpret either trusted or user.overlay.opaque,
+		// regardless of the mount's xattr namespace. A marker in the
+		// inactive namespace can wrongly delete inherited files. Delegate
+		// opaque directories to the mounted-view walking differ.
+		if kind == fs.ChangeKindDelete && filepath.Base(path) == ".wh..opq" {
+			return fmt.Errorf("overlay opaque directory %q requires walking differ: %w", path, errdefs.ErrNotImplemented)
+		}
+		if info != nil && info.Mode().IsRegular() {
+			whiteout, checkErr := hasOverlayXattrWhiteout(filepath.Join(upperDir, path))
+			if checkErr != nil {
+				return fmt.Errorf("cannot inspect overlay whiteout %q: %v: %w", path, checkErr, errdefs.ErrNotImplemented)
+			}
+			if whiteout {
+				return fmt.Errorf("overlay xattr whiteout %q requires walking differ: %w", path, errdefs.ErrNotImplemented)
+			}
+		}
+		return handle(kind, path, info, nil)
+	}
+}
+
+// hasOverlayRootOpacity detects opacity on the root of an upperdir. The
+// continuity fast path skips the root directory, so it cannot emit an OCI
+// opaque marker or the inherited-file deletions for a root-level opaque xattr.
+// Be conservative if the attribute cannot be inspected.
+func hasOverlayRootOpacity(upperDir string) (bool, error) {
+	for _, name := range []string{"trusted.overlay.opaque", "user.overlay.opaque"} {
+		_, err := unix.Lgetxattr(upperDir, name, nil)
+		switch {
+		case err == nil:
+			return true, nil
+		case errors.Is(err, unix.ENODATA), errors.Is(err, unix.ENOTSUP):
+			continue
+		default:
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// hasNestedLowerMount reports mountpoints below the temporarily mounted lower
+// root. A recursive bind can expose submounts that are not represented by the
+// overlay's lowerdir paths, so comparing against its mounted view is unsafe.
+func hasNestedLowerMount(root string, mounts []*mountinfo.Info) (nested, foundRoot bool) {
+	root = filepath.Clean(root)
+	prefix := root + string(os.PathSeparator)
+	for _, entry := range mounts {
+		if entry.Mountpoint == root {
+			foundRoot = true
+		} else if strings.HasPrefix(entry.Mountpoint, prefix) {
+			nested = true
+		}
+	}
+	return nested, foundRoot
+}
+
+// requireFlatLowerMount ensures that the temporary lower mount has no nested
+// mountpoints that could change the view relative to the overlay lowerdir.
+// Fail closed if mountinfo is unavailable or the temporary mount is not found.
+func requireFlatLowerMount(root string) error {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("cannot resolve lower mount %q: %v: %w", root, err, errdefs.ErrNotImplemented)
+	}
+	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(realRoot))
+	if err != nil {
+		return fmt.Errorf("cannot inspect nested lower mounts: %v: %w", err, errdefs.ErrNotImplemented)
+	}
+	nested, foundRoot := hasNestedLowerMount(realRoot, mounts)
+	if nested || !foundRoot {
+		return fmt.Errorf("lower mount %q has nested or unverified mountpoints: %w", realRoot, errdefs.ErrNotImplemented)
+	}
+	return nil
+}
+
+// requireSafeUpperDir checks metadata that continuity's DiffDirChanges does
+// not compare. This walks only the upperdir; if a change cannot be represented
+// safely, the service retries with the generic walking differ.
+func requireSafeUpperDir(ctx context.Context, lowerRoot, upperDir string) error {
+	return filepath.Walk(upperDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		relative, err := filepath.Rel(upperDir, path)
+		if err != nil {
+			return err
+		}
+		lowerPath := filepath.Join(lowerRoot, relative)
+		lowerInfo, err := os.Lstat(lowerPath)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			// A character device with major/minor 0/0 is an overlay
+			// whiteout, not an added device node. Without a matching
+			// lower entry continuity would archive it as a device.
+			if info.Mode()&os.ModeCharDevice != 0 {
+				if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Rdev == 0 {
+					return fmt.Errorf("orphan overlay whiteout %q needs walking differ: %w", relative, errdefs.ErrNotImplemented)
+				}
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		// os.Stat in the recorded continuity dependency follows lower
+		// symlinks, including dangling links and directory ancestors.
+		// This can misclassify a whiteout or read outside the lower tree.
+		if lowerInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("lower symlink %q needs walking differ: %w", relative, errdefs.ErrNotImplemented)
+		}
+
+		if info.IsDir() && !lowerInfo.IsDir() {
+			// A file-to-directory replacement makes continuity's later
+			// base lookups return ENOTDIR on nested files.
+			return fmt.Errorf("lower non-directory %q needs walking differ: %w", relative, errdefs.ErrNotImplemented)
+		}
+		if !info.IsDir() || !lowerInfo.IsDir() {
+			return nil
+		}
+
+		upperStat, upperOK := info.Sys().(*syscall.Stat_t)
+		lowerStat, lowerOK := lowerInfo.Sys().(*syscall.Stat_t)
+		if !upperOK || !lowerOK || upperStat.Uid != lowerStat.Uid || upperStat.Gid != lowerStat.Gid {
+			// Otherwise a directory-only ownership change is skipped
+			// when size, mode and mtime happen to match.
+			return fmt.Errorf("directory ownership %q needs walking differ: %w", relative, errdefs.ErrNotImplemented)
+		}
+
+		// The fast directory comparison also ignores security.capability.
+		// If the xattr differs, let the walking differ emit the change.
+		upperCap, upperErr := directoryCapability(path)
+		lowerCap, lowerErr := directoryCapability(lowerPath)
+		if upperErr != nil || lowerErr != nil || !bytes.Equal(upperCap, lowerCap) {
+			return fmt.Errorf("directory capability %q needs walking differ: %w", relative, errdefs.ErrNotImplemented)
+		}
+		return nil
+	})
+}
+
+func directoryCapability(path string) ([]byte, error) {
+	value, err := sysx.LGetxattr(path, "security.capability")
+	if errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTSUP) {
+		return nil, nil
+	}
+	return value, err
+}
+
+// contextWriter propagates cancellation through the archive writer, including
+// while writing a large file. ChangeWriter's internal file copier otherwise
+// uses context.TODO() and cannot observe cancellation during a file copy.
+type contextWriter struct {
+	ctx    context.Context
+	writer io.Writer
+}
+
+func (w contextWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.writer.Write(p)
+}
+
+func withCancellation(ctx context.Context, handle fs.ChangeFunc) fs.ChangeFunc {
+	return func(kind fs.ChangeKind, path string, info os.FileInfo, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return handle(kind, path, info, err)
+	}
 }
 
 // writeDiff writes the layer diff from an overlay upper directory to w.
-// It uses fs.DiffDirChanges with DiffSourceOverlayFS to walk only the upperdir
-// instead of traversing both the lower and upper directory trees. This avoids
-// reading the (potentially large) lower layers entirely.
+// A safety preflight and fs.DiffDirChanges each walk the upperdir, but neither
+// traverses the entire lower tree. The bounded extra upperdir walk avoids
+// archiving filesystem changes that continuity cannot safely represent.
 func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperDir string, opts []archive.ChangeWriterOpt) error {
+	opaque, err := hasOverlayRootOpacity(upperDir)
+	if err != nil {
+		return fmt.Errorf("cannot inspect overlay upperdir root opacity: %v: %w", err, errdefs.ErrNotImplemented)
+	}
+	if opaque {
+		return fmt.Errorf("opaque overlay upperdir root requires walking differ: %w", errdefs.ErrNotImplemented)
+	}
 	return mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
-		cw := archive.NewChangeWriter(w, upperDir, opts...)
-		err := fs.DiffDirChanges(ctx, lowerRoot, upperDir, fs.DiffSourceOverlayFS, cw.HandleChange)
+		if err := requireFlatLowerMount(lowerRoot); err != nil {
+			return err
+		}
+		if err := requireSafeUpperDir(ctx, lowerRoot, upperDir); err != nil {
+			return err
+		}
+		cw := archive.NewChangeWriter(contextWriter{ctx: ctx, writer: w}, upperDir, opts...)
+		err := fs.DiffDirChanges(ctx, lowerRoot, upperDir, fs.DiffSourceOverlayFS,
+			withCancellation(ctx, withOverlayWhiteoutFallback(upperDir, cw.HandleChange)))
 		if err != nil {
 			return fmt.Errorf("failed to create diff tar stream: %w", err)
 		}
@@ -96,8 +455,8 @@ func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperDir s
 // surface the error directly to the caller.
 func (s *overlayDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (ocispec.Descriptor, error) {
 	upperDir := getUpperDir(upper)
-	if upperDir == "" {
-		return emptyDesc, fmt.Errorf("upper mounts are not overlay-backed: %w", errdefs.ErrNotImplemented)
+	if upperDir == "" || !overlayFastPathFeaturesDisabled(upper[0].Options) || !overlayLowerMatches(lower, upper) {
+		return emptyDesc, fmt.Errorf("overlay fast path is not safe for these mounts: %w", errdefs.ErrNotImplemented)
 	}
 
 	var config diff.Config
@@ -190,8 +549,8 @@ func (s *overlayDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 				return emptyDesc, fmt.Errorf("failed to get compressed stream: %w", errOpen)
 			}
 		}
-		errOpen = writeDiff(ctx, io.MultiWriter(compressed, dgstr.Hash()), lower, upperDir, changeWriterOpts)
-		compressed.Close()
+		errOpen = finalizeCompressedDiff(compressed,
+			writeDiff(ctx, io.MultiWriter(compressed, dgstr.Hash()), lower, upperDir, changeWriterOpts))
 		if errOpen != nil {
 			return emptyDesc, fmt.Errorf("failed to write compressed diff: %w", errOpen)
 		}
